@@ -6,6 +6,122 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
 
+def format_tensor_preview(tensor: torch.Tensor, max_values: int = 6) -> str:
+    flat = tensor.detach().flatten().float()
+    if flat.numel() == 0:
+        return "[]"
+
+    preview_values = ", ".join(
+        f"{value:.4f}" for value in flat[:max_values].tolist())
+    if flat.numel() > max_values:
+        preview_values += ", ..."
+    return f"[{preview_values}]"
+
+
+def print_model_report(model: nn.Module, preview_values: int = 6) -> None:
+    print("model architecture:")
+    print(model)
+    print()
+    print("parameter summary:")
+
+    total_parameters = 0
+    trainable_parameters = 0
+
+    for name, parameter in model.named_parameters():
+        parameter_count = parameter.numel()
+        total_parameters += parameter_count
+        if parameter.requires_grad:
+            trainable_parameters += parameter_count
+
+        data = parameter.detach().float()
+        mean = float(data.mean())
+        std = float(data.std(unbiased=False)) if data.numel() > 1 else 0.0
+        preview = format_tensor_preview(parameter, max_values=preview_values)
+        print(
+            f"- {name}: shape={tuple(parameter.shape)}, params={parameter_count}, "
+            f"mean={mean:.6f}, std={std:.6f}, preview={preview}"
+        )
+
+    print()
+    print(f"total parameters: {total_parameters}")
+    print(f"trainable parameters: {trainable_parameters}")
+
+
+class CharTokenizer:
+    def __init__(self, vocab: list[str]):
+        self.vocab = vocab
+        self.stoi = {char: idx for idx, char in enumerate(vocab)}
+        self.itos = {idx: char for idx, char in enumerate(vocab)}
+
+    @classmethod
+    def from_text(cls, text: str) -> "CharTokenizer":
+        vocab = sorted(set(text))
+        return cls(vocab)
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.vocab)
+
+    def encode(self, text: str) -> list[int]:
+        unknown_chars = sorted(
+            {char for char in text if char not in self.stoi})
+        if unknown_chars:
+            raise ValueError(
+                f"Input text contains unknown characters: {unknown_chars}")
+        return [self.stoi[char] for char in text]
+
+    def decode(self, token_ids: list[int]) -> str:
+        return "".join(self.itos[token_id] for token_id in token_ids)
+
+
+def build_training_sequences(text: str, tokenizer: CharTokenizer, block_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    encoded = tokenizer.encode(text)
+    if len(encoded) <= block_size:
+        raise ValueError("Training text must be longer than block_size")
+
+    x_data: list[list[int]] = []
+    y_data: list[list[int]] = []
+    for start in range(len(encoded) - block_size):
+        chunk = encoded[start:start + block_size + 1]
+        x_data.append(chunk[:-1])
+        y_data.append(chunk[1:])
+
+    x = torch.tensor(x_data, dtype=torch.long)
+    y = torch.tensor(y_data, dtype=torch.long)
+    return x, y
+
+
+def train_language_model(
+    model: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    steps: int = 250,
+    batch_size: int = 32,
+    learning_rate: float = 3e-4,
+) -> None:
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    sample_count = x.size(0)
+    batch_size = min(batch_size, sample_count)
+    log_interval = max(1, steps // 10)
+
+    for step in range(1, steps + 1):
+        batch_indices = torch.randint(
+            0, sample_count, (batch_size,), device=x.device)
+        batch_x = x[batch_indices]
+        batch_y = y[batch_indices]
+
+        _, loss = model(batch_x, batch_y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        if step == 1 or step % log_interval == 0 or step == steps:
+            print(f"step {step:4d}/{steps}  loss={float(loss.detach()):.6f}")
+
+    model.eval()
+
+
 @dataclass
 class TransformerConfig:
     vocab_size: int
@@ -122,6 +238,7 @@ class TransformerLM(nn.Module):
                 f"Sequence length {seq_len} exceeds block_size {self.config.block_size}")
 
         positions = torch.arange(seq_len, device=idx.device).unsqueeze(0)
+        positions = positions.expand(batch_size, seq_len)
         x = self.token_embedding(idx) + self.position_embedding(positions)
         x = self.dropout(x)
 
@@ -140,6 +257,9 @@ class TransformerLM(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0) -> torch.Tensor:
+        if temperature <= 0:
+            raise ValueError("temperature must be greater than 0")
+
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.config.block_size:]
             logits, _ = self(idx_cond)
@@ -151,11 +271,51 @@ class TransformerLM(nn.Module):
 
 
 if __name__ == "__main__":
-    config = TransformerConfig(vocab_size=100, block_size=32)
-    model = TransformerLM(config)
+    torch.manual_seed(42)
 
-    batch = torch.randint(0, config.vocab_size, (2, 16))
-    targets = torch.randint(0, config.vocab_size, (2, 16))
-    logits, loss = model(batch, targets)
+    training_text = (
+        "transformers are sequence models. "
+        "large language models use transformer blocks for next token prediction. "
+        "attention helps the model focus on relevant previous tokens. "
+    ) * 30
+
+    tokenizer = CharTokenizer.from_text(training_text)
+    config = TransformerConfig(vocab_size=tokenizer.vocab_size, block_size=32)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = TransformerLM(config).to(device)
+
+    print_model_report(model)
+    print()
+
+    x_train, y_train = build_training_sequences(
+        training_text, tokenizer, config.block_size)
+    x_train = x_train.to(device)
+    y_train = y_train.to(device)
+
+    print(f"device: {device}")
+    print(f"vocab size: {tokenizer.vocab_size}")
+    print(f"training sequences: {x_train.size(0)}")
+    print()
+    print("training...")
+    train_language_model(model, x_train, y_train, steps=250,
+                         batch_size=32, learning_rate=3e-4)
+    print()
+
+    demo_batch = x_train[:2]
+    demo_targets = y_train[:2]
+
+    with torch.no_grad():
+        logits, loss = model(demo_batch, demo_targets)
+        prompt = "transformers "
+        prompt_ids = torch.tensor(
+            [tokenizer.encode(prompt)], dtype=torch.long, device=device)
+        generated_ids = model.generate(
+            prompt_ids, max_new_tokens=120, temperature=0.9)
+        generated_text = tokenizer.decode(generated_ids[0].tolist())
+
+    print("demo batch shape:", demo_batch.shape)
     print("logits shape:", logits.shape)
     print("loss:", float(loss))
+    print("generated tokens:", generated_ids)
+    print("generated text:")
+    print(generated_text)
