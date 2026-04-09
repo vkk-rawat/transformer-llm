@@ -1,9 +1,18 @@
-from dataclasses import dataclass
+import argparse
+from dataclasses import asdict, dataclass
 import math
+from pathlib import Path
 from typing import Optional
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
+
+
+DEFAULT_TRAINING_TEXT = (
+    "transformers are sequence models. "
+    "large language models use transformer blocks for next token prediction. "
+    "attention helps the model focus on relevant previous tokens. "
+) * 30
 
 
 def format_tensor_preview(tensor: torch.Tensor, max_values: int = 6) -> str:
@@ -91,10 +100,51 @@ def build_training_sequences(text: str, tokenizer: CharTokenizer, block_size: in
     return x, y
 
 
+def split_train_val(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    val_ratio: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not 0.0 <= val_ratio < 1.0:
+        raise ValueError("val_ratio must be in [0.0, 1.0)")
+
+    sample_count = x.size(0)
+    if sample_count < 2 or val_ratio == 0.0:
+        return x, y, x[:0], y[:0]
+
+    val_size = max(1, int(sample_count * val_ratio))
+    if val_size >= sample_count:
+        val_size = sample_count - 1
+
+    return x[:-val_size], y[:-val_size], x[-val_size:], y[-val_size:]
+
+
+@torch.no_grad()
+def evaluate_language_model(
+    model: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> float:
+    if x.numel() == 0 or y.numel() == 0:
+        return float("nan")
+
+    was_training = model.training
+    model.eval()
+    _, loss = model(x, y)
+    if was_training:
+        model.train()
+
+    if loss is None:
+        raise RuntimeError("Expected loss when evaluating language model")
+    return float(loss.detach())
+
+
 def train_language_model(
     model: nn.Module,
     x: torch.Tensor,
     y: torch.Tensor,
+    x_val: Optional[torch.Tensor] = None,
+    y_val: Optional[torch.Tensor] = None,
     steps: int = 250,
     batch_size: int = 32,
     learning_rate: float = 3e-4,
@@ -117,7 +167,16 @@ def train_language_model(
         optimizer.step()
 
         if step == 1 or step % log_interval == 0 or step == steps:
-            print(f"step {step:4d}/{steps}  loss={float(loss.detach()):.6f}")
+            train_loss = float(loss.detach())
+            message = f"step {step:4d}/{steps}  train_loss={train_loss:.6f}"
+
+            if x_val is not None and y_val is not None and x_val.numel() > 0 and y_val.numel() > 0:
+                val_loss = evaluate_language_model(model, x_val, y_val)
+                if math.isfinite(val_loss):
+                    perplexity = math.exp(min(val_loss, 20.0))
+                    message += f"  val_loss={val_loss:.6f}  val_ppl={perplexity:.3f}"
+
+            print(message)
 
     model.eval()
 
@@ -270,47 +329,178 @@ class TransformerLM(nn.Module):
         return idx
 
 
-if __name__ == "__main__":
-    torch.manual_seed(42)
+def load_training_text(path: Optional[str]) -> str:
+    if not path:
+        return DEFAULT_TRAINING_TEXT
 
-    training_text = (
-        "transformers are sequence models. "
-        "large language models use transformer blocks for next token prediction. "
-        "attention helps the model focus on relevant previous tokens. "
-    ) * 30
+    text_file = Path(path)
+    if not text_file.exists():
+        raise FileNotFoundError(f"Training text file not found: {text_file}")
 
-    tokenizer = CharTokenizer.from_text(training_text)
-    config = TransformerConfig(vocab_size=tokenizer.vocab_size, block_size=32)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    text = text_file.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError("Training text file is empty")
+    return text
+
+
+def save_checkpoint(
+    model: TransformerLM,
+    tokenizer: CharTokenizer,
+    config: TransformerConfig,
+    checkpoint_path: str,
+) -> None:
+    path = Path(checkpoint_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "config": asdict(config),
+        "vocab": tokenizer.vocab,
+    }
+    torch.save(checkpoint, path)
+    print(f"checkpoint saved: {path}")
+
+
+def load_checkpoint(
+    checkpoint_path: str,
+    device: torch.device,
+) -> tuple[TransformerLM, CharTokenizer, TransformerConfig]:
+    path = Path(checkpoint_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+    checkpoint = torch.load(path, map_location=device)
+    config = TransformerConfig(**checkpoint["config"])
+    tokenizer = CharTokenizer(checkpoint["vocab"])
     model = TransformerLM(config).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    print(f"checkpoint loaded: {path}")
+    return model, tokenizer, config
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Train and sample from a small decoder-only Transformer LM",
+    )
+    parser.add_argument("--text-file", type=str, default=None,
+                        help="Path to a UTF-8 text file for training data")
+    parser.add_argument("--steps", type=int, default=250,
+                        help="Training steps")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Mini-batch size")
+    parser.add_argument("--learning-rate", type=float, default=3e-4,
+                        help="AdamW learning rate")
+    parser.add_argument("--val-ratio", type=float, default=0.1,
+                        help="Validation split ratio in [0.0, 1.0)")
+
+    parser.add_argument("--block-size", type=int, default=32)
+    parser.add_argument("--n-embd", type=int, default=128)
+    parser.add_argument("--n-head", type=int, default=4)
+    parser.add_argument("--n-layer", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.1)
+
+    parser.add_argument("--prompt", type=str,
+                        default="transformers ", help="Prompt for generation")
+    parser.add_argument("--max-new-tokens", type=int, default=120)
+    parser.add_argument("--temperature", type=float, default=0.9)
+
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save-checkpoint", type=str, default=None,
+                        help="Path to save model checkpoint after training")
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="Path to load model checkpoint before training")
+    parser.add_argument("--skip-training", action="store_true",
+                        help="Skip training and only run generation")
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_arg_parser().parse_args()
+    torch.manual_seed(args.seed)
+
+    training_text = load_training_text(args.text_file)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.load_checkpoint:
+        model, tokenizer, config = load_checkpoint(
+            args.load_checkpoint, device)
+    else:
+        tokenizer = CharTokenizer.from_text(training_text)
+        config = TransformerConfig(
+            vocab_size=tokenizer.vocab_size,
+            block_size=args.block_size,
+            n_embd=args.n_embd,
+            n_head=args.n_head,
+            n_layer=args.n_layer,
+            dropout=args.dropout,
+        )
+        model = TransformerLM(config).to(device)
 
     print_model_report(model)
     print()
 
-    x_train, y_train = build_training_sequences(
+    x_all, y_all = build_training_sequences(
         training_text, tokenizer, config.block_size)
+    x_train, y_train, x_val, y_val = split_train_val(
+        x_all, y_all, val_ratio=args.val_ratio)
+
     x_train = x_train.to(device)
     y_train = y_train.to(device)
+    x_val = x_val.to(device)
+    y_val = y_val.to(device)
 
     print(f"device: {device}")
     print(f"vocab size: {tokenizer.vocab_size}")
     print(f"training sequences: {x_train.size(0)}")
+    print(f"validation sequences: {x_val.size(0)}")
     print()
-    print("training...")
-    train_language_model(model, x_train, y_train, steps=250,
-                         batch_size=32, learning_rate=3e-4)
+    if args.skip_training:
+        print("training skipped (--skip-training set)")
+    else:
+        print("training...")
+        train_language_model(
+            model,
+            x_train,
+            y_train,
+            x_val=x_val,
+            y_val=y_val,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+        )
+
+    if args.save_checkpoint:
+        save_checkpoint(model, tokenizer, config, args.save_checkpoint)
+
     print()
 
-    demo_batch = x_train[:2]
-    demo_targets = y_train[:2]
+    demo_batch = x_train[:2] if x_train.size(0) >= 2 else x_all[:2].to(device)
+    demo_targets = y_train[:2] if y_train.size(
+        0) >= 2 else y_all[:2].to(device)
 
     with torch.no_grad():
         logits, loss = model(demo_batch, demo_targets)
-        prompt = "transformers "
+
+        prompt = args.prompt
+        try:
+            prompt_tokens = tokenizer.encode(prompt)
+        except ValueError:
+            fallback_prompt = training_text[: min(16, len(training_text))]
+            print(
+                "prompt contains unknown characters for this tokenizer; "
+                f"using fallback prompt: {fallback_prompt!r}"
+            )
+            prompt = fallback_prompt
+            prompt_tokens = tokenizer.encode(prompt)
+
         prompt_ids = torch.tensor(
-            [tokenizer.encode(prompt)], dtype=torch.long, device=device)
+            [prompt_tokens], dtype=torch.long, device=device)
         generated_ids = model.generate(
-            prompt_ids, max_new_tokens=120, temperature=0.9)
+            prompt_ids,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+        )
         generated_text = tokenizer.decode(generated_ids[0].tolist())
 
     print("demo batch shape:", demo_batch.shape)
